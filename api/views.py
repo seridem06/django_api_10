@@ -1,60 +1,108 @@
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
+from .models import EsquemaNegocio, DatoNegocio
 import json
-
-schemas_store = []
-data_store = []
+from collections import OrderedDict
 
 @csrf_exempt
 def manage_schemas(request):
     if request.method == 'GET':
-        return JsonResponse(schemas_store, safe=False)
+        # Consultar todos los esquemas de la BD
+        esquemas = list(EsquemaNegocio.objects.all().values())
+        return JsonResponse(esquemas, safe=False)
+    
     if request.method == 'POST':
         payload = json.loads(request.body)
-        schemas_store.append(payload)
+        # Crear registro persistente en SQLite
+        EsquemaNegocio.objects.create(
+            nombre=payload['nombre'],
+            config=payload['config'],
+            campos=payload['campos']
+        )
         return JsonResponse(payload, status=201)
+
+    if request.method == 'DELETE':
+        nombre_negocio = request.GET.get('nombre')
+        # Eliminar esquema y sus datos de la BD en cascada
+        EsquemaNegocio.objects.filter(nombre=nombre_negocio).delete()
+        DatoNegocio.objects.filter(negocio=nombre_negocio).delete()
+        return JsonResponse({'status': 'deleted'}, status=204)
 
 @csrf_exempt
 def manage_data(request):
     negocio_target = request.GET.get('negocio')
 
     if request.method == 'GET':
-        filtered_data = [d for d in data_store if d.get('_negocio') == negocio_target]
-        return JsonResponse(filtered_data, safe=False)
+        # Filtrar datos por negocio en la BD
+        registros = DatoNegocio.objects.filter(negocio=negocio_target)
+        
+        # FORZAR QUE EL ID APAREZCA PRIMERO EN EL JSON
+        datos_ordenados = []
+        for r in registros:
+            contenido = r.contenido
+            # Usamos OrderedDict para garantizar la jerarquía visual del ID
+            item_ordenado = OrderedDict([('id', contenido.get('id'))])
+            for key, value in contenido.items():
+                if key != 'id':
+                    item_ordenado[key] = value
+            datos_ordenados.append(item_ordenado)
+            
+        return JsonResponse(datos_ordenados, safe=False)
     
     if request.method == 'POST':
         payload = json.loads(request.body)
         
-        # LÓGICA DE ID AUTOMÁTICO INDEPENDIENTE
-        if not payload.get('id'):
-            # Buscamos el ID más alto SOLO de este negocio
-            datos_del_negocio = [d for d in data_store if d.get('_negocio') == negocio_target]
-            if datos_del_negocio:
-                max_id = max([int(d.get('id', 0)) for d in datos_del_negocio])
-                payload['id'] = max_id + 1
-            else:
-                payload['id'] = 1
+        # Conversión inteligente para decimales y enteros
+        for key, value in payload.items():
+            if isinstance(value, str) and value.strip():
+                if value.replace('.', '', 1).isdigit():
+                    payload[key] = float(value) if '.' in value else int(value)
+        
+        # Lógica de ID Automático consultando la BD SQLite
+        if not payload.get('id') or payload.get('id') == "AUTO":
+            max_id = 0
+            datos_previos = DatoNegocio.objects.filter(negocio=negocio_target)
+            if datos_previos.exists():
+                # Obtenemos el ID más alto registrado para este negocio
+                max_id = max([int(r.contenido.get('id', 0)) for r in datos_previos])
+            payload['id'] = max_id + 1
         else:
-            payload['id'] = int(payload['id'])
+            try:
+                payload['id'] = int(payload['id'])
+            except ValueError: pass
             
-        payload['_negocio'] = negocio_target
-        data_store.append(payload)
+        # Guardar el dato en la BD persistente
+        DatoNegocio.objects.create(negocio=negocio_target, contenido=payload)
         return JsonResponse(payload, status=201)
 
 @csrf_exempt
 def manage_detail(request, record_id):
     negocio_target = request.GET.get('negocio')
-    item = next((d for d in data_store if str(d.get('id')) == str(record_id) and d.get('_negocio') == negocio_target), None)
+    
+    # Buscar el registro específico en la BD
+    registros = DatoNegocio.objects.filter(negocio=negocio_target)
+    target_obj = None
+    for r in registros:
+        if str(r.contenido.get('id')) == str(record_id):
+            target_obj = r
+            break
 
-    if not item: return JsonResponse({'error': 'No encontrado'}, status=404)
+    if not target_obj: 
+        return JsonResponse({'error': 'No encontrado'}, status=404)
 
     if request.method == 'DELETE':
-        data_store.remove(item)
+        target_obj.delete()
         return JsonResponse({'status': 'deleted'}, status=204)
 
     if request.method == 'PUT':
         new_data = json.loads(request.body)
-        item.update(new_data)
-        return JsonResponse(item)
+        for key, value in new_data.items():
+            if isinstance(value, str) and value.replace('.', '', 1).isdigit():
+                new_data[key] = float(value) if '.' in value else int(value)
+                
+        # Actualizar JSON y guardar en BD
+        target_obj.contenido.update(new_data)
+        target_obj.save()
+        return JsonResponse(target_obj.contenido)
     
     return JsonResponse({'error': 'Method not allowed'}, status=405)
